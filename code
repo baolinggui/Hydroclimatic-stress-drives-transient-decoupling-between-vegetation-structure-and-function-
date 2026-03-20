@@ -1,0 +1,1668 @@
+# =========================================
+# 0. 环境与路径
+# =========================================
+import os
+import re
+import json
+from pathlib import Path
+from collections import defaultdict
+
+import numpy as np
+import pandas as pd
+import rasterio
+
+GEE_DIR = Path("/content/drive/MyDrive/Crop_Remote_Sensing_US/GEE_CornBelt")
+SIF_DIR = Path("/content/drive/MyDrive/Crop_Remote_Sensing_US/SIF")
+OUT_DIR = Path("/content/drive/MyDrive/Crop_Remote_Sensing_US/_inventory")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+print("GEE_DIR exists:", GEE_DIR.exists(), GEE_DIR)
+print("SIF_DIR exists:", SIF_DIR.exists(), SIF_DIR)
+
+# =========================================
+# 1. 工具函数
+# =========================================
+def list_files_recursive(root: Path, exts=None):
+    """
+    递归列出文件。exts 例如 ['.tif', '.csv']
+    """
+    files = []
+    for p in root.rglob("*"):
+        if p.is_file():
+            if exts is None:
+                files.append(p)
+            else:
+                if p.suffix.lower() in [e.lower() for e in exts]:
+                    files.append(p)
+    return sorted(files)
+
+def extract_year_month_from_name(name: str):
+    """
+    尝试从文件名中提取 year / month
+    支持：
+    - 2017
+    - 2017_01
+    - 2017-01
+    - 201701
+    返回 (year, month)；若 month 不存在则为 None
+    """
+    # 先找 YYYY_MM 或 YYYY-MM
+    m = re.search(r'(?<!\d)(20\d{2})[_-](0[1-9]|1[0-2])(?!\d)', name)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+
+    # 再找 YYYYMM
+    m = re.search(r'(?<!\d)(20\d{2})(0[1-9]|1[0-2])(?!\d)', name)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+
+    # 只找年份
+    m = re.search(r'(?<!\d)(20\d{2})(?!\d)', name)
+    if m:
+        return int(m.group(1)), None
+
+    return None, None
+
+def infer_dataset_type(name: str):
+    """
+    根据文件名粗略判断数据类型
+    """
+    low = name.lower()
+    if "vod" in low:
+        return "VOD"
+    if re.search(r'(^|[_\-])sm([_\-]|$)', low) or "soil" in low:
+        return "SM"
+    if "climate" in low:
+        return "Climate"
+    if "cropmask" in low or "crop_mask" in low:
+        return "CropMask"
+    if "sif" in low:
+        return "SIF"
+    if low.endswith(".csv"):
+        return "CSV"
+    return "Unknown"
+
+def safe_open_raster_meta(fp: Path):
+    """
+    安全读取 tif 基本信息
+    """
+    try:
+        with rasterio.open(fp) as ds:
+            meta = {
+                "width": ds.width,
+                "height": ds.height,
+                "count": ds.count,
+                "crs": str(ds.crs) if ds.crs else None,
+                "dtype": ds.dtypes[0] if ds.count > 0 else None,
+                "nodata": ds.nodata,
+                "bounds_left": ds.bounds.left,
+                "bounds_bottom": ds.bounds.bottom,
+                "bounds_right": ds.bounds.right,
+                "bounds_top": ds.bounds.top,
+                "res_x": ds.res[0],
+                "res_y": ds.res[1],
+                "driver": ds.driver,
+            }
+            # band descriptions
+            descs = list(ds.descriptions) if ds.descriptions is not None else []
+            meta["band_descriptions"] = json.dumps(descs, ensure_ascii=False)
+        return meta
+    except Exception as e:
+        return {
+            "width": None,
+            "height": None,
+            "count": None,
+            "crs": None,
+            "dtype": None,
+            "nodata": None,
+            "bounds_left": None,
+            "bounds_bottom": None,
+            "bounds_right": None,
+            "bounds_top": None,
+            "res_x": None,
+            "res_y": None,
+            "driver": None,
+            "band_descriptions": None,
+            "read_error": str(e)
+        }
+
+# =========================================
+# 2. 扫描 GEE 文件夹
+# =========================================
+gee_files = list_files_recursive(GEE_DIR, exts=[".tif", ".tiff", ".csv"])
+print(f"GEE files found: {len(gee_files)}")
+
+gee_rows = []
+for fp in gee_files:
+    year, month = extract_year_month_from_name(fp.name)
+    dtype = infer_dataset_type(fp.name)
+    row = {
+        "source": "GEE",
+        "folder": str(fp.parent),
+        "filename": fp.name,
+        "filepath": str(fp),
+        "suffix": fp.suffix.lower(),
+        "dataset_type": dtype,
+        "year": year,
+        "month": month,
+        "size_mb": round(fp.stat().st_size / 1024 / 1024, 3),
+    }
+    if fp.suffix.lower() in [".tif", ".tiff"]:
+        row.update(safe_open_raster_meta(fp))
+    gee_rows.append(row)
+
+df_gee = pd.DataFrame(gee_rows)
+print("\nGEE inventory preview:")
+print(df_gee.head())
+
+# =========================================
+# 3. 扫描 SIF 文件夹
+# =========================================
+sif_files = list_files_recursive(SIF_DIR, exts=[".tif", ".tiff", ".nc", ".hdf", ".csv"])
+print(f"\nSIF files found: {len(sif_files)}")
+
+sif_rows = []
+for fp in sif_files:
+    year, month = extract_year_month_from_name(fp.name)
+    dtype = "SIF"
+    row = {
+        "source": "SIF",
+        "folder": str(fp.parent),
+        "filename": fp.name,
+        "filepath": str(fp),
+        "suffix": fp.suffix.lower(),
+        "dataset_type": dtype,
+        "year": year,
+        "month": month,
+        "size_mb": round(fp.stat().st_size / 1024 / 1024, 3),
+    }
+    if fp.suffix.lower() in [".tif", ".tiff"]:
+        row.update(safe_open_raster_meta(fp))
+    sif_rows.append(row)
+
+df_sif = pd.DataFrame(sif_rows)
+print("\nSIF inventory preview:")
+print(df_sif.head())
+
+# =========================================
+# 4. 合并总清单
+# =========================================
+df_all = pd.concat([df_gee, df_sif], ignore_index=True)
+
+# 排序更清晰
+sort_cols = [c for c in ["source", "dataset_type", "year", "month", "filename"] if c in df_all.columns]
+df_all = df_all.sort_values(sort_cols).reset_index(drop=True)
+
+print("\nAll inventory summary:")
+print(df_all[["source", "dataset_type", "year", "month", "filename", "size_mb"]].head(20))
+
+# 保存总清单
+all_csv = OUT_DIR / "file_inventory_all.csv"
+gee_csv = OUT_DIR / "file_inventory_gee.csv"
+sif_csv = OUT_DIR / "file_inventory_sif.csv"
+
+df_all.to_csv(all_csv, index=False)
+df_gee.to_csv(gee_csv, index=False)
+df_sif.to_csv(sif_csv, index=False)
+
+print("\nSaved:")
+print(all_csv)
+print(gee_csv)
+print(sif_csv)
+
+# =========================================
+# 5. 生成月份覆盖表
+# =========================================
+def build_month_coverage(df, dataset_name):
+    """
+    构建 year-month 覆盖表
+    """
+    sub = df.copy()
+    sub = sub[sub["year"].notna()].copy()
+    sub["year"] = sub["year"].astype(int)
+
+    if "month" not in sub.columns:
+        sub["month"] = np.nan
+
+    out = []
+    years = sorted(sub["year"].dropna().unique().tolist())
+    for y in years:
+        row = {"dataset_type": dataset_name, "year": y}
+        for m in range(1, 13):
+            exists = (((sub["year"] == y) & (sub["month"] == m)).any())
+            row[f"m{m:02d}"] = int(exists)
+        row["n_months"] = sum(row[f"m{m:02d}"] for m in range(1, 13))
+        out.append(row)
+    return pd.DataFrame(out)
+
+# GEE 按类型分别看
+coverage_rows = []
+for dtype in sorted(df_gee["dataset_type"].dropna().unique()):
+    sub = df_gee[df_gee["dataset_type"] == dtype]
+    cov = build_month_coverage(sub, dtype)
+    if len(cov) > 0:
+        coverage_rows.append(cov)
+
+# SIF
+cov_sif = build_month_coverage(df_sif, "SIF")
+if len(cov_sif) > 0:
+    coverage_rows.append(cov_sif)
+
+df_cov = pd.concat(coverage_rows, ignore_index=True) if coverage_rows else pd.DataFrame()
+cov_csv = OUT_DIR / "year_month_coverage.csv"
+df_cov.to_csv(cov_csv, index=False)
+
+print("\nYear-month coverage:")
+print(df_cov.head(20))
+print("\nSaved:", cov_csv)
+
+# =========================================
+# 6. 输出一个更适合后续分析的“核心文件表”
+#    只保留最重要的信息
+# =========================================
+core_cols = [
+    "source", "dataset_type", "year", "month", "filename", "filepath",
+    "suffix", "size_mb", "count", "width", "height", "crs", "res_x", "res_y"
+]
+core_cols = [c for c in core_cols if c in df_all.columns]
+df_core = df_all[core_cols].copy()
+
+core_csv = OUT_DIR / "file_inventory_core.csv"
+df_core.to_csv(core_csv, index=False)
+
+print("\nCore inventory preview:")
+print(df_core.head(20))
+print("\nSaved:", core_csv)
+
+# =========================================
+# 7. 简单汇总打印
+# =========================================
+print("\n========== SUMMARY ==========")
+print("Total files:", len(df_all))
+print("\nBy source:")
+print(df_all["source"].value_counts(dropna=False))
+
+print("\nBy dataset_type:")
+print(df_all["dataset_type"].value_counts(dropna=False))
+
+if "suffix" in df_all.columns:
+    print("\nBy suffix:")
+    print(df_all["suffix"].value_counts(dropna=False))
+
+print("\nTotal size by source (MB):")
+print(df_all.groupby("source")["size_mb"].sum().round(2))
+
+print("\nTotal size by dataset_type (MB):")
+print(df_all.groupby("dataset_type")["size_mb"].sum().round(2))
+
+
+# =========================================
+# Step 1A. Read and visualize current county CSV
+# =========================================
+import os
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+CSV_PATH = Path("/content/drive/MyDrive/Crop_Remote_Sensing_US/GEE_CornBelt/CornBelt_monthly_county_2017_2021_clean.csv")
+OUT_DIR = Path("/content/drive/MyDrive/Crop_Remote_Sensing_US/_analysis_step1_figs")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# -----------------------------
+# 1. Read
+# -----------------------------
+df = pd.read_csv(CSV_PATH)
+print("shape:", df.shape)
+print("columns:", df.columns.tolist())
+print(df.head())
+
+# -----------------------------
+# 2. Keep useful columns only
+# -----------------------------
+keep_cols = [
+    "GEOID", "NAME", "STATEFP",
+    "year", "month",
+    "vod", "sm", "precip", "t2m_c", "vpd"
+]
+keep_cols = [c for c in keep_cols if c in df.columns]
+df = df[keep_cols].copy()
+
+print("\nColumns kept:", keep_cols)
+
+# -----------------------------
+# 3. Convert dtypes
+# -----------------------------
+for c in ["year", "month", "vod", "sm", "precip", "t2m_c", "vpd"]:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+df["date"] = pd.to_datetime(
+    dict(year=df["year"].astype(int), month=df["month"].astype(int), day=1),
+    errors="coerce"
+)
+
+df = df.dropna(subset=["date", "year", "month"]).copy()
+
+print("\nAfter cleaning:", df.shape)
+
+# -----------------------------
+# 4. Detect available variables
+# -----------------------------
+candidate_vars = ["precip", "sm", "vod", "t2m_c", "vpd"]
+vars_avail = [v for v in candidate_vars if v in df.columns]
+
+print("\nAvailable variables:", vars_avail)
+
+print("\nMissing values:")
+print(df[vars_avail].isna().sum())
+
+# Summary
+summary = df[vars_avail].describe()
+print("\nSummary statistics:")
+print(summary)
+summary.to_csv(OUT_DIR / "summary_statistics.csv")
+
+# -----------------------------
+# 5. Regional monthly mean
+# -----------------------------
+ts = (
+    df.groupby("date")[vars_avail]
+      .mean()
+      .reset_index()
+      .sort_values("date")
+)
+ts.to_csv(OUT_DIR / "regional_monthly_mean_timeseries.csv", index=False)
+
+print("\nRegional mean preview:")
+print(ts.head())
+
+# -----------------------------
+# 6. Plot 1: full monthly time series
+# -----------------------------
+for var in vars_avail:
+    plt.figure(figsize=(10, 4))
+    plt.plot(ts["date"], ts[var], marker="o")
+    plt.title(f"Corn Belt monthly mean: {var}")
+    plt.xlabel("Date")
+    plt.ylabel(var)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / f"timeseries_{var}.png", dpi=220)
+    plt.show()
+
+# -----------------------------
+# 7. Plot 2: seasonal cycle
+# -----------------------------
+seasonal = (
+    df.groupby("month")[vars_avail]
+      .mean()
+      .reset_index()
+      .sort_values("month")
+)
+seasonal.to_csv(OUT_DIR / "seasonal_cycle_mean.csv", index=False)
+
+for var in vars_avail:
+    plt.figure(figsize=(7, 4))
+    plt.plot(seasonal["month"], seasonal[var], marker="o")
+    plt.xticks(range(1, 13))
+    plt.title(f"Seasonal cycle: {var}")
+    plt.xlabel("Month")
+    plt.ylabel(var)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / f"seasonal_cycle_{var}.png", dpi=220)
+    plt.show()
+
+# -----------------------------
+# 8. Plot 3: standardized all-in-one comparison
+# -----------------------------
+zts = ts.copy()
+for var in vars_avail:
+    mu = zts[var].mean()
+    sd = zts[var].std()
+    zts[var] = (zts[var] - mu) / sd if sd > 0 else np.nan
+
+plt.figure(figsize=(11, 5))
+for var in vars_avail:
+    plt.plot(zts["date"], zts[var], marker="o", label=var)
+plt.title("Standardized monthly mean time series")
+plt.xlabel("Date")
+plt.ylabel("Z-score")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig(OUT_DIR / "timeseries_standardized_all.png", dpi=240)
+plt.show()
+
+# -----------------------------
+# 9. Plot 4: correlation heatmap
+# -----------------------------
+corr = df[vars_avail].corr()
+
+fig, ax = plt.subplots(figsize=(6, 5))
+im = ax.imshow(corr.values)
+
+ax.set_xticks(range(len(vars_avail)))
+ax.set_yticks(range(len(vars_avail)))
+ax.set_xticklabels(vars_avail, rotation=45, ha="right")
+ax.set_yticklabels(vars_avail)
+ax.set_title("Correlation matrix")
+
+for i in range(len(vars_avail)):
+    for j in range(len(vars_avail)):
+        ax.text(j, i, f"{corr.values[i, j]:.2f}", ha="center", va="center")
+
+fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+plt.tight_layout()
+plt.savefig(OUT_DIR / "correlation_heatmap.png", dpi=220)
+plt.show()
+
+corr.to_csv(OUT_DIR / "correlation_matrix.csv")
+
+# -----------------------------
+# 10. Plot 5: pairwise scatter plots
+# -----------------------------
+pairs = []
+if "vod" in vars_avail and "vpd" in vars_avail:
+    pairs.append(("vpd", "vod"))
+if "vod" in vars_avail and "precip" in vars_avail:
+    pairs.append(("precip", "vod"))
+if "vod" in vars_avail and "t2m_c" in vars_avail:
+    pairs.append(("t2m_c", "vod"))
+
+for xvar, yvar in pairs:
+    plt.figure(figsize=(5.5, 4.5))
+    plt.scatter(df[xvar], df[yvar], s=8, alpha=0.25)
+    plt.xlabel(xvar)
+    plt.ylabel(yvar)
+    plt.title(f"{yvar} vs {xvar}")
+    plt.grid(True, alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / f"scatter_{yvar}_vs_{xvar}.png", dpi=220)
+    plt.show()
+
+# -----------------------------
+# 11. Plot 6: by-year seasonal vod curve
+# -----------------------------
+if "vod" in vars_avail:
+    seasonal_year = (
+        df.groupby(["year", "month"])["vod"]
+          .mean()
+          .reset_index()
+          .sort_values(["year", "month"])
+    )
+    seasonal_year.to_csv(OUT_DIR / "vod_seasonal_by_year.csv", index=False)
+
+    plt.figure(figsize=(8, 4.5))
+    for y, sub in seasonal_year.groupby("year"):
+        plt.plot(sub["month"], sub["vod"], marker="o", label=str(int(y)))
+    plt.xticks(range(1, 13))
+    plt.xlabel("Month")
+    plt.ylabel("vod")
+    plt.title("Seasonal VOD by year")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / "vod_seasonal_by_year.png", dpi=220)
+    plt.show()
+
+print(f"\nOutputs saved to: {OUT_DIR}")
+
+# ============================================================
+# Fix SM extraction from tif (NaN issue) and update tables
+# ============================================================
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import rasterio
+
+BASE_DIR = Path("/content/drive/MyDrive/Crop_Remote_Sensing_US")
+GEE_DIR = BASE_DIR / "GEE_CornBelt"
+OUT_DIR = BASE_DIR / "_analysis_step2_fixSM"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+CSV_CLEAN = GEE_DIR / "CornBelt_monthly_county_2017_2021_clean.csv"
+
+# -----------------------------
+# 1. Helper
+# -----------------------------
+def parse_year_from_name(name):
+    import re
+    m = re.search(r'(20\d{2})', name)
+    return int(m.group(1)) if m else None
+
+def extract_monthly_means_from_stack_nan_safe(fp, value_name):
+    year = parse_year_from_name(fp.name)
+    rows = []
+
+    with rasterio.open(fp) as ds:
+        descs = list(ds.descriptions) if ds.descriptions is not None else []
+
+        for b in range(1, ds.count + 1):
+            arr = ds.read(b, masked=True).astype("float64")
+
+            # 关键修复：把 masked 和内部 nan 都统一成 np.nan
+            arr_np = arr.filled(np.nan)
+
+            val = float(np.nanmean(arr_np)) if np.isfinite(arr_np).any() else np.nan
+
+            rows.append({
+                "year": year,
+                "month": b,   # annual monthly stack: band 1..12 -> month 1..12
+                value_name: val,
+                "source_tif": str(fp),
+                "band": b,
+                "band_desc": descs[b - 1] if len(descs) >= b else None,
+                "band_min": float(np.nanmin(arr_np)) if np.isfinite(arr_np).any() else np.nan,
+                "band_max": float(np.nanmax(arr_np)) if np.isfinite(arr_np).any() else np.nan,
+                "n_valid": int(np.isfinite(arr_np).sum())
+            })
+
+    return pd.DataFrame(rows)
+
+# -----------------------------
+# 2. Recover SM again
+# -----------------------------
+sm_tifs = sorted(GEE_DIR.glob("CornBelt_SM_monthly_*.tif"))
+print("SM tif files found:", len(sm_tifs))
+
+sm_parts = []
+for fp in sm_tifs:
+    df_part = extract_monthly_means_from_stack_nan_safe(fp, "sm_roi_mean_from_tif")
+    sm_parts.append(df_part)
+
+df_sm = pd.concat(sm_parts, ignore_index=True).sort_values(["year", "month"]).reset_index(drop=True)
+
+print("\nRecovered SM preview:")
+print(df_sm.head(15))
+
+sm_csv = OUT_DIR / "CornBelt_monthly_sm_from_tif_2017_2021_fixed.csv"
+df_sm.to_csv(sm_csv, index=False)
+print("\nSaved:", sm_csv)
+
+# -----------------------------
+# 3. Read county clean CSV
+# -----------------------------
+df_county = pd.read_csv(CSV_CLEAN)
+
+keep_cols = [
+    "GEOID", "NAME", "STATEFP",
+    "year", "month",
+    "vod", "precip", "t2m_c", "vpd"
+]
+keep_cols = [c for c in keep_cols if c in df_county.columns]
+df_county = df_county[keep_cols].copy()
+
+for c in ["year", "month", "vod", "precip", "t2m_c", "vpd"]:
+    if c in df_county.columns:
+        df_county[c] = pd.to_numeric(df_county[c], errors="coerce")
+
+df_county["date"] = pd.to_datetime(
+    dict(year=df_county["year"].astype(int), month=df_county["month"].astype(int), day=1),
+    errors="coerce"
+)
+
+# -----------------------------
+# 4. Build regional monthly table and merge SM
+# -----------------------------
+vars_avail = [c for c in ["precip", "vod", "t2m_c", "vpd"] if c in df_county.columns]
+
+df_regional = (
+    df_county.groupby(["year", "month", "date"])[vars_avail]
+             .mean()
+             .reset_index()
+             .sort_values(["year", "month"])
+)
+
+df_regional = df_regional.merge(
+    df_sm[["year", "month", "sm_roi_mean_from_tif"]],
+    on=["year", "month"],
+    how="left"
+)
+
+if "precip" in df_regional.columns:
+    df_regional["precip_mm"] = df_regional["precip"] * 1000.0
+
+regional_csv = OUT_DIR / "CornBelt_regional_monthly_mean_2017_2021_withSM_fixed.csv"
+df_regional.to_csv(regional_csv, index=False)
+
+print("\nRegional monthly table with SM preview:")
+print(df_regional.head(12))
+print("\nSaved:", regional_csv)
+
+# -----------------------------
+# 5. Update county table
+# -----------------------------
+df_county_with_sm = df_county.merge(
+    df_sm[["year", "month", "sm_roi_mean_from_tif"]],
+    on=["year", "month"],
+    how="left"
+)
+
+county_with_sm_csv = GEE_DIR / "CornBelt_monthly_county_2017_2021_clean_plusSMroi_fixed.csv"
+df_county_with_sm.to_csv(county_with_sm_csv, index=False)
+
+print("\nCounty table + ROI mean SM preview:")
+print(df_county_with_sm.head())
+print("\nSaved:", county_with_sm_csv)
+
+# -----------------------------
+# 6. Quick plot
+# -----------------------------
+import matplotlib.pyplot as plt
+
+plot_cols = [c for c in ["precip_mm", "sm_roi_mean_from_tif", "vod", "t2m_c", "vpd"] if c in df_regional.columns]
+
+for var in plot_cols:
+    plt.figure(figsize=(10, 4))
+    plt.plot(df_regional["date"], df_regional[var], marker="o")
+    plt.title(f"Corn Belt monthly mean: {var}")
+    plt.xlabel("Date")
+    plt.ylabel(var)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / f"timeseries_{var}.png", dpi=220)
+    plt.show()
+
+print("\nAll SM-fixed outputs saved in:", OUT_DIR)
+
+from pathlib import Path
+import re
+import pandas as pd
+import rasterio
+
+SIF_DIR = Path("/content/drive/MyDrive/Crop_Remote_Sensing_US/SIF")
+OUT_DIR = Path("/content/drive/MyDrive/Crop_Remote_Sensing_US/_analysis_step2_fixSIF")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+def parse_gosif_year_month_from_path(path_str):
+    # 支持从完整路径里找 GOSIF_2017.M01 这种模式
+    m = re.search(r'GOSIF_(20\d{2})\.M(0[1-9]|1[0-2])', path_str)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None, None
+
+candidate_exts = {".tif", ".tiff", ".img", ".bil", ".nc", ".hdf"}
+
+rows = []
+for p in SIF_DIR.rglob("*"):
+    if p.is_file() and p.suffix.lower() in candidate_exts:
+        try:
+            with rasterio.open(p) as ds:
+                year, month = parse_gosif_year_month_from_path(str(p))
+                rows.append({
+                    "filepath": str(p),
+                    "filename": p.name,
+                    "year": year,
+                    "month": month,
+                    "count": ds.count,
+                    "width": ds.width,
+                    "height": ds.height,
+                    "crs": str(ds.crs),
+                    "left": ds.bounds.left,
+                    "bottom": ds.bounds.bottom,
+                    "right": ds.bounds.right,
+                    "top": ds.bounds.top,
+                    "res_x": ds.res[0],
+                    "res_y": ds.res[1],
+                    "size_mb": round(p.stat().st_size / 1024 / 1024, 4)
+                })
+        except:
+            pass
+
+df_sif_real = pd.DataFrame(rows).sort_values(["year", "month", "filename"]).reset_index(drop=True)
+out_csv = OUT_DIR / "SIF_real_raster_inventory.csv"
+df_sif_real.to_csv(out_csv, index=False)
+
+print(df_sif_real.head(20))
+print("\nSaved:", out_csv)
+print("\nTotal valid SIF rasters:", len(df_sif_real))
+
+# ============================================================
+# Clip all GOSIF files to Corn Belt using MemoryFile
+# ============================================================
+
+from pathlib import Path
+import re
+import pandas as pd
+import rasterio
+from rasterio.io import MemoryFile
+from rasterio.windows import from_bounds
+
+SIF_DIR = Path("/content/drive/MyDrive/Crop_Remote_Sensing_US/SIF")
+OUT_DIR = Path("/content/drive/MyDrive/Crop_Remote_Sensing_US/_analysis_step2_fixSIF")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+ROI = {
+    "left": -98.0,
+    "bottom": 38.0,
+    "right": -84.0,
+    "top": 45.0
+}
+
+def parse_gosif_year_month(name):
+    m = re.search(r'GOSIF_(20\d{2})\.M(0[1-9]|1[0-2])', name)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None, None
+
+def clip_tif_to_roi_memoryfile(in_fp, out_fp, roi_bounds):
+    data = in_fp.read_bytes()
+
+    with MemoryFile(data) as memfile:
+        with memfile.open() as src:
+            if str(src.crs) != "EPSG:4326":
+                raise ValueError(f"{in_fp.name} CRS is {src.crs}, expected EPSG:4326")
+
+            win = from_bounds(
+                roi_bounds["left"], roi_bounds["bottom"],
+                roi_bounds["right"], roi_bounds["top"],
+                transform=src.transform
+            ).round_offsets().round_lengths()
+
+            out_data = src.read(window=win)
+            out_transform = src.window_transform(win)
+
+            profile = src.profile.copy()
+            profile.update({
+                "height": out_data.shape[1],
+                "width": out_data.shape[2],
+                "transform": out_transform
+            })
+
+            with rasterio.open(out_fp, "w", **profile) as dst:
+                dst.write(out_data)
+
+                if src.descriptions is not None:
+                    for i, desc in enumerate(src.descriptions, start=1):
+                        try:
+                            dst.set_band_description(i, desc if desc is not None else "")
+                        except:
+                            pass
+
+sif_files = sorted(SIF_DIR.glob("GOSIF_*.tif"))
+print("GOSIF files found:", len(sif_files))
+
+rows = []
+for fp in sif_files:
+    year, month = parse_gosif_year_month(fp.name)
+    out_fp = SIF_DIR / f"{fp.stem}_CornBeltClip.tif"
+
+    try:
+        if not out_fp.exists():
+            clip_tif_to_roi_memoryfile(fp, out_fp, ROI)
+            status = "created"
+        else:
+            status = "exists"
+
+        with rasterio.open(out_fp) as ds:
+            rows.append({
+                "source_file": fp.name,
+                "clipped_file": out_fp.name,
+                "year": year,
+                "month": month,
+                "status": status,
+                "width": ds.width,
+                "height": ds.height,
+                "count": ds.count,
+                "crs": str(ds.crs),
+                "res_x": ds.res[0],
+                "res_y": ds.res[1],
+                "left": ds.bounds.left,
+                "bottom": ds.bounds.bottom,
+                "right": ds.bounds.right,
+                "top": ds.bounds.top
+            })
+    except Exception as e:
+        rows.append({
+            "source_file": fp.name,
+            "clipped_file": out_fp.name,
+            "year": year,
+            "month": month,
+            "status": f"failed: {repr(e)}"
+        })
+
+df_clip = pd.DataFrame(rows).sort_values(["year", "month"]).reset_index(drop=True)
+clip_csv = OUT_DIR / "GOSIF_CornBeltClip_inventory_2017_2021.csv"
+df_clip.to_csv(clip_csv, index=False)
+
+print(df_clip.head())
+print("Saved:", clip_csv)
+
+# ============================================================
+# Memory-optimized 0.25° grid panel builder
+# One region at a time
+# ============================================================
+
+import re
+import gc
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import rasterio
+from rasterio.windows import from_bounds
+from rasterio.warp import reproject, Resampling
+
+# -----------------------------
+# Paths
+# -----------------------------
+BASE_DIR = Path("/content/drive/MyDrive/Crop_Remote_Sensing_US")
+GEE_DIR = BASE_DIR / "GEE_CornBelt"
+SIF_DIR = BASE_DIR / "SIF"
+OUT_DIR = BASE_DIR / "_grid_panel_optimized"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# -----------------------------
+# Region: run ONE first
+# -----------------------------
+REGION = {
+    "name": "HumidCore_IA_IL",
+    "left": -94.0,
+    "bottom": 40.0,
+    "right": -89.0,
+    "top": 43.5
+}
+
+YEARS = [2017, 2018, 2019, 2020, 2021]
+MONTHS = list(range(1, 13))
+CROP_FRAC_THRESHOLD = 0.30
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def parse_year(name):
+    m = re.search(r'(20\d{2})', name)
+    return int(m.group(1)) if m else None
+
+def parse_gosif_year_month(name):
+    m = re.search(r'GOSIF_(20\d{2})\.M(0[1-9]|1[0-2])', name)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None, None
+
+def get_template(vod_fp, region):
+    with rasterio.open(vod_fp) as ds:
+        win = from_bounds(
+            region["left"], region["bottom"],
+            region["right"], region["top"],
+            transform=ds.transform
+        ).round_offsets().round_lengths()
+
+        arr = ds.read(1, window=win, masked=True)
+        transform = ds.window_transform(win)
+
+        return {
+            "window": win,
+            "height": arr.shape[0],
+            "width": arr.shape[1],
+            "transform": transform,
+            "crs": ds.crs
+        }
+
+def extract_subset(fp, band, window):
+    with rasterio.open(fp) as ds:
+        arr = ds.read(band, window=window, masked=True).astype("float64")
+        return arr.filled(np.nan)
+
+def reproject_full_to_template(src_fp, dst_shape, dst_transform, dst_crs, clean_sif=False):
+    with rasterio.open(src_fp) as src:
+        src_arr = src.read(1, masked=True).astype("float64").filled(np.nan)
+
+        if clean_sif:
+            src_arr[src_arr >= 32766] = np.nan
+            src_arr[src_arr < -999] = np.nan
+
+        dst = np.full(dst_shape, np.nan, dtype="float64")
+
+        reproject(
+            source=src_arr,
+            destination=dst,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+            src_nodata=np.nan,
+            dst_nodata=np.nan,
+            resampling=Resampling.average
+        )
+
+    return dst
+
+def build_lonlat(height, width, transform):
+    rows, cols = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
+    xs = transform.c + (cols + 0.5) * transform.a
+    ys = transform.f + (rows + 0.5) * transform.e
+    return xs, ys
+
+# -----------------------------
+# File maps
+# -----------------------------
+vod_files = {parse_year(fp.name): fp for fp in sorted(GEE_DIR.glob("CornBelt_VOD_monthly_*.tif"))}
+sm_files = {parse_year(fp.name): fp for fp in sorted(GEE_DIR.glob("CornBelt_SM_monthly_*.tif"))}
+clim_files = {parse_year(fp.name): fp for fp in sorted(GEE_DIR.glob("CornBelt_Climate_monthly_*.tif"))}
+crop_files = {parse_year(fp.name): fp for fp in sorted(GEE_DIR.glob("CornBelt_CropMask_*.tif"))}
+
+sif_map = {}
+for fp in sorted(SIF_DIR.rglob("GOSIF_*.tif")):
+    if fp.is_file():
+        y, m = parse_gosif_year_month(fp.name)
+        if y is not None:
+            sif_map[(y, m)] = fp
+
+print("VOD years:", sorted(vod_files))
+print("SM years:", sorted(sm_files))
+print("Climate years:", sorted(clim_files))
+print("Crop years:", sorted(crop_files))
+print("SIF entries:", len(sif_map))
+
+# -----------------------------
+# 1. Template grid
+# -----------------------------
+template = get_template(vod_files[2017], REGION)
+h, w = template["height"], template["width"]
+win = template["window"]
+transform = template["transform"]
+crs = template["crs"]
+
+print("Template shape:", h, w)
+
+# -----------------------------
+# 2. Build static valid grid mask
+#    Use crop fraction from a representative year first
+#    (you can later switch to year-specific crop fraction)
+# -----------------------------
+crop_ref_fp = crop_files[2019]
+
+crop_frac_ref = reproject_full_to_template(
+    src_fp=crop_ref_fp,
+    dst_shape=(h, w),
+    dst_transform=transform,
+    dst_crs=crs,
+    clean_sif=False
+)
+
+valid_mask = np.isfinite(crop_frac_ref) & (crop_frac_ref >= CROP_FRAC_THRESHOLD)
+valid_idx = np.flatnonzero(valid_mask.ravel())
+
+print("Total grid cells:", h * w)
+print("Crop-dominant valid cells:", len(valid_idx))
+
+# optional lon/lat only for valid cells
+lon2d, lat2d = build_lonlat(h, w, transform)
+lon_valid = lon2d.ravel()[valid_idx]
+lat_valid = lat2d.ravel()[valid_idx]
+crop_valid_ref = crop_frac_ref.ravel()[valid_idx]
+
+# save grid reference
+df_grid_ref = pd.DataFrame({
+    "grid_idx": valid_idx.astype(int),
+    "lon": lon_valid,
+    "lat": lat_valid,
+    "crop_fraction_ref2019": crop_valid_ref
+})
+grid_ref_csv = OUT_DIR / f"{REGION['name']}_grid_reference.csv"
+df_grid_ref.to_csv(grid_ref_csv, index=False)
+print("Saved grid reference:", grid_ref_csv)
+
+# -----------------------------
+# 3. Stream through year-month
+# -----------------------------
+rows_out = []
+
+for year in YEARS:
+    print(f"\nProcessing year {year} ...")
+
+    vod_fp = vod_files[year]
+    sm_fp = sm_files[year]
+    clim_fp = clim_files[year]
+
+    # year-specific crop fraction if you want dynamic crop mask
+    crop_frac_year = reproject_full_to_template(
+        src_fp=crop_files[year],
+        dst_shape=(h, w),
+        dst_transform=transform,
+        dst_crs=crs,
+        clean_sif=False
+    )
+    crop_year_valid = crop_frac_year.ravel()[valid_idx]
+
+    for month in MONTHS:
+        # --- read only needed bands
+        vod_arr = extract_subset(vod_fp, month, win)
+        sm_arr = extract_subset(sm_fp, month, win)
+
+        b_precip = (month - 1) * 3 + 1
+        b_t2m    = (month - 1) * 3 + 2
+        b_vpd    = (month - 1) * 3 + 3
+
+        precip_arr = extract_subset(clim_fp, b_precip, win) * 1000.0
+        t2m_arr    = extract_subset(clim_fp, b_t2m, win)
+        vpd_arr    = extract_subset(clim_fp, b_vpd, win)
+
+        # --- SIF reproject to template
+        sif_fp = sif_map.get((year, month), None)
+        if sif_fp is not None:
+            sif_arr = reproject_full_to_template(
+                src_fp=sif_fp,
+                dst_shape=(h, w),
+                dst_transform=transform,
+                dst_crs=crs,
+                clean_sif=True
+            ) * 0.0001
+        else:
+            sif_arr = np.full((h, w), np.nan, dtype="float64")
+
+        # --- flatten only valid cells
+        vod_v = vod_arr.ravel()[valid_idx]
+        sm_v = sm_arr.ravel()[valid_idx]
+        precip_v = precip_arr.ravel()[valid_idx]
+        t2m_v = t2m_arr.ravel()[valid_idx]
+        vpd_v = vpd_arr.ravel()[valid_idx]
+        sif_v = sif_arr.ravel()[valid_idx]
+
+        # keep rows where at least core variables exist
+        keep = np.isfinite(vod_v) | np.isfinite(sm_v) | np.isfinite(sif_v)
+
+        df_m = pd.DataFrame({
+            "region": REGION["name"],
+            "year": year,
+            "month": month,
+            "grid_idx": valid_idx[keep].astype(int),
+            "lon": lon_valid[keep],
+            "lat": lat_valid[keep],
+            "crop_fraction": crop_year_valid[keep],
+            "vod": vod_v[keep],
+            "sm": sm_v[keep],
+            "precip_mm": precip_v[keep],
+            "t2m_c": t2m_v[keep],
+            "vpd": vpd_v[keep],
+            "sif": sif_v[keep]
+        })
+
+        rows_out.append(df_m)
+
+        # release
+        del vod_arr, sm_arr, precip_arr, t2m_arr, vpd_arr, sif_arr
+        del vod_v, sm_v, precip_v, t2m_v, vpd_v, sif_v, df_m
+        gc.collect()
+
+# -----------------------------
+# 4. Save final panel
+# -----------------------------
+panel = pd.concat(rows_out, ignore_index=True)
+panel["date"] = pd.to_datetime(dict(year=panel["year"], month=panel["month"], day=1))
+
+out_csv = OUT_DIR / f"{REGION['name']}_grid_panel_2017_2021.csv"
+panel.to_csv(out_csv, index=False)
+
+print("\nFinal panel shape:", panel.shape)
+print(panel.head())
+print("Saved:", out_csv)
+
+# Optional lightweight summary
+summary = panel.describe(include="all")
+summary.to_csv(OUT_DIR / f"{REGION['name']}_grid_panel_summary.csv")
+print("Saved summary.")
+
+# ============================================================
+# Event-centered composite plot (top-journal style, Scheme C)
+# line + 95% CI + faint bootstrap trajectories
+# ============================================================
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ============================================================
+# 0. Paths
+# ============================================================
+PANEL_PATH = "/content/drive/MyDrive/Crop_Remote_Sensing_US/_whole_area_analysis/step6_struct_func_decoupling/panel_with_DI_step2.csv"
+OUT_DIR = "/content/drive/MyDrive/Crop_Remote_Sensing_US/_whole_area_analysis/event_composite_topjournal"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ============================================================
+# 1. Load data
+# ============================================================
+df = pd.read_csv(PANEL_PATH)
+
+df["time"] = pd.to_datetime(
+    df["year"].astype(int).astype(str) + "-" +
+    df["month"].astype(int).astype(str).str.zfill(2) + "-01"
+)
+
+df["VPD"] = df["vpd"]
+df["SM"] = df["sm"]
+df["SSRD"] = df["ssrd"]
+df["T2M"] = df["t2m"]
+df["PRECIP"] = df["precip"]
+
+# ============================================================
+# 2. Basic cleaning
+# ============================================================
+grow = df[df["month"].isin([4, 5, 6, 7, 8, 9, 10])].copy()
+
+for c in ["DI", "z_vod", "z_sif", "VPD", "SM"]:
+    grow = grow[grow[c].notna()]
+    grow = grow[grow[c] != 0]
+
+# 可选：去掉极端异常值
+grow = grow[(grow["DI"] > -5) & (grow["DI"] < 5)].copy()
+
+# ============================================================
+# 3. Define events
+# ============================================================
+EVENT_THRESHOLD = -1.0
+WINDOW = 4   # -4 to +4
+
+grow["event"] = (grow["DI"] < EVENT_THRESHOLD).astype(int)
+
+# ============================================================
+# 4. Extract event-centered panel
+# ============================================================
+records = []
+
+for gid, g in grow.groupby("grid_id"):
+    g = g.sort_values("time").reset_index(drop=True)
+    event_idx = g.index[g["event"] == 1].tolist()
+
+    for idx in event_idx:
+        for rel in range(-WINDOW, WINDOW + 1):
+            j = idx + rel
+            if 0 <= j < len(g):
+                row = {
+                    "grid_id": gid,
+                    "event_time": g.loc[idx, "time"],
+                    "rel_month": rel
+                }
+                ok = True
+                for v in ["DI", "z_vod", "z_sif", "VPD", "SM"]:
+                    val = g.loc[j, v]
+                    if pd.isna(val) or val == 0:
+                        ok = False
+                        break
+                    row[v] = val
+                if ok:
+                    records.append(row)
+
+event_panel = pd.DataFrame(records)
+assert len(event_panel) > 0, "No event-centered records extracted."
+
+event_panel.to_csv(os.path.join(OUT_DIR, "event_centered_panel_window4.csv"), index=False)
+
+# 简单统计
+n_events = event_panel[["grid_id", "event_time"]].drop_duplicates().shape[0]
+n_grids = event_panel["grid_id"].nunique()
+
+print("Event-centered rows:", len(event_panel))
+print("Unique events:", n_events)
+print("Unique grids :", n_grids)
+
+# ============================================================
+# 5. Bootstrap composite (cluster bootstrap by grid)
+# ============================================================
+rng = np.random.default_rng(42)
+n_boot = 300
+
+grid_ids = event_panel["grid_id"].unique()
+boot_list = []
+
+for b in range(n_boot):
+    sampled_grids = rng.choice(grid_ids, size=len(grid_ids), replace=True)
+    boot_df = pd.concat(
+        [event_panel[event_panel["grid_id"] == gid] for gid in sampled_grids],
+        ignore_index=True
+    )
+
+    comp = (
+        boot_df.groupby("rel_month")[["DI", "z_vod", "z_sif", "VPD", "SM"]]
+        .median()
+        .reset_index()
+    )
+    comp["boot"] = b
+    boot_list.append(comp)
+
+boot_panel = pd.concat(boot_list, ignore_index=True)
+boot_panel.to_csv(os.path.join(OUT_DIR, "event_centered_bootstrap_panel.csv"), index=False)
+
+# observed median
+obs = (
+    event_panel.groupby("rel_month")[["DI", "z_vod", "z_sif", "VPD", "SM"]]
+    .median()
+    .reset_index()
+)
+
+# summarize CI
+def summarize_ci(var):
+    out = (
+        boot_panel.groupby("rel_month")[var]
+        .agg(
+            median_boot="median",
+            ci_low=lambda x: np.nanpercentile(x, 2.5),
+            ci_high=lambda x: np.nanpercentile(x, 97.5)
+        )
+        .reset_index()
+    )
+    out = out.rename(columns={
+        "median_boot": f"{var}_boot",
+        "ci_low": f"{var}_low",
+        "ci_high": f"{var}_high"
+    })
+    return out
+
+sum_di  = summarize_ci("DI")
+sum_vod = summarize_ci("z_vod")
+sum_sif = summarize_ci("z_sif")
+sum_vpd = summarize_ci("VPD")
+sum_sm  = summarize_ci("SM")
+
+plot_top = obs.merge(sum_di, on="rel_month").merge(sum_vod, on="rel_month").merge(sum_sif, on="rel_month")
+plot_bot = obs.merge(sum_vpd, on="rel_month").merge(sum_sm, on="rel_month")
+
+# ============================================================
+# 6. Style
+# ============================================================
+plt.rcParams.update({
+    "figure.dpi": 180,
+    "savefig.dpi": 300,
+    "font.size": 11,
+    "axes.titlesize": 15,
+    "axes.labelsize": 12,
+    "legend.fontsize": 10,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+})
+
+COL = {
+    "vod": "#6C9DC6",
+    "sif": "#E39B6D",
+    "di":  "#C77C8D",
+    "vpd": "#D47F7F",
+    "sm":  "#6FAF9F",
+    "ink": "#364958",
+    "gray": "#9AA3AC",
+}
+
+# ============================================================
+# 7. Plot top-journal style figure
+# ============================================================
+fig, axes = plt.subplots(
+    2, 1, figsize=(8.6, 8.4),
+    gridspec_kw={"height_ratios": [1.1, 0.95]},
+    sharex=True
+)
+
+# -----------------------------
+# (a) structure / function / DI
+# -----------------------------
+ax = axes[0]
+
+# faint bootstrap trajectories
+for b in range(min(n_boot, 120)):  # 不用全画，避免太密
+    sub = boot_panel[boot_panel["boot"] == b].sort_values("rel_month")
+    ax.plot(sub["rel_month"], sub["z_vod"], color=COL["vod"], alpha=0.03, linewidth=1)
+    ax.plot(sub["rel_month"], sub["z_sif"], color=COL["sif"], alpha=0.03, linewidth=1)
+    ax.plot(sub["rel_month"], sub["DI"],    color=COL["di"],  alpha=0.03, linewidth=1)
+
+# CI bands
+ax.fill_between(plot_top["rel_month"], plot_top["z_vod_low"], plot_top["z_vod_high"],
+                color=COL["vod"], alpha=0.15, linewidth=0)
+ax.fill_between(plot_top["rel_month"], plot_top["z_sif_low"], plot_top["z_sif_high"],
+                color=COL["sif"], alpha=0.15, linewidth=0)
+ax.fill_between(plot_top["rel_month"], plot_top["DI_low"], plot_top["DI_high"],
+                color=COL["di"], alpha=0.15, linewidth=0)
+
+# observed medians
+ax.plot(plot_top["rel_month"], plot_top["z_vod"], marker="o", color=COL["vod"], linewidth=2.3, label="z(VOD)")
+ax.plot(plot_top["rel_month"], plot_top["z_sif"], marker="o", color=COL["sif"], linewidth=2.3, label="z(SIF)")
+ax.plot(plot_top["rel_month"], plot_top["DI"],    marker="o", color=COL["di"],  linewidth=2.5, label="DI")
+
+ax.axvline(0, linestyle="--", color=COL["gray"], linewidth=1.3)
+ax.axhline(0, linestyle="--", color=COL["ink"], linewidth=1.2)
+ax.set_ylabel("Standardized anomaly / DI")
+ax.set_title("a  Structural and functional trajectories around negative decoupling events")
+ax.legend(frameon=False, ncol=3, loc="lower left")
+ax.grid(axis="y", alpha=0.18)
+
+# annotate event
+ax.text(0.02, 0.96, f"N events = {n_events}\nN grids = {n_grids}",
+        transform=ax.transAxes, ha="left", va="top", fontsize=10, color=COL["ink"])
+
+# -----------------------------
+# (b) hydroclimatic conditions
+# -----------------------------
+ax = axes[1]
+
+# faint bootstrap trajectories
+for b in range(min(n_boot, 120)):
+    sub = boot_panel[boot_panel["boot"] == b].sort_values("rel_month")
+    ax.plot(sub["rel_month"], sub["VPD"], color=COL["vpd"], alpha=0.03, linewidth=1)
+
+# VPD CI + line
+ax.fill_between(plot_bot["rel_month"], plot_bot["VPD_low"], plot_bot["VPD_high"],
+                color=COL["vpd"], alpha=0.15, linewidth=0)
+ax.plot(plot_bot["rel_month"], plot_bot["VPD"], marker="o", color=COL["vpd"], linewidth=2.3, label="VPD")
+
+ax.axvline(0, linestyle="--", color=COL["gray"], linewidth=1.3)
+ax.set_ylabel("VPD", color=COL["vpd"])
+ax.tick_params(axis="y", labelcolor=COL["vpd"])
+ax.grid(axis="y", alpha=0.18)
+
+# second axis for SM
+ax2 = ax.twinx()
+
+for b in range(min(n_boot, 120)):
+    sub = boot_panel[boot_panel["boot"] == b].sort_values("rel_month")
+    ax2.plot(sub["rel_month"], sub["SM"], color=COL["sm"], alpha=0.03, linewidth=1)
+
+ax2.fill_between(plot_bot["rel_month"], plot_bot["SM_low"], plot_bot["SM_high"],
+                 color=COL["sm"], alpha=0.15, linewidth=0)
+ax2.plot(plot_bot["rel_month"], plot_bot["SM"], marker="o", color=COL["sm"], linewidth=2.3, label="SM")
+ax2.set_ylabel("SM", color=COL["sm"])
+ax2.tick_params(axis="y", labelcolor=COL["sm"])
+
+# combined legend
+lines1, labels1 = ax.get_legend_handles_labels()
+lines2, labels2 = ax2.get_legend_handles_labels()
+ax.legend(lines1 + lines2, labels1 + labels2, frameon=False, loc="upper right")
+
+ax.set_xlabel("Months relative to negative decoupling event")
+axes[1].set_title("b  Hydroclimatic conditions preceding decoupling events")
+
+plt.tight_layout()
+fig.savefig(os.path.join(OUT_DIR, "event_centered_composite_topjournal.png"), dpi=300, bbox_inches="tight")
+plt.show()
+
+# ============================================================
+# 8. Optional: export figure-ready summary table
+# ============================================================
+top_export = plot_top.copy()
+bot_export = plot_bot.copy()
+top_export.to_csv(os.path.join(OUT_DIR, "event_centered_top_panel_summary.csv"), index=False)
+bot_export.to_csv(os.path.join(OUT_DIR, "event_centered_bottom_panel_summary.csv"), index=False)
+
+print("\nSaved outputs to:")
+print(OUT_DIR)
+
+# ============================================================
+# Smoothed DI–VPD curves under different SM regimes
+# with bootstrap 95% confidence intervals
+# ============================================================
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from statsmodels.nonparametric.smoothers_lowess import lowess
+
+# ============================================================
+# 0. Paths
+# ============================================================
+PANEL_PATH = "/content/drive/MyDrive/Crop_Remote_Sensing_US/_whole_area_analysis/step6_struct_func_decoupling/panel_with_DI_step2.csv"
+OUT_DIR = "/content/drive/MyDrive/Crop_Remote_Sensing_US/_whole_area_analysis/fig_DI_VPD_SM_smooth"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ============================================================
+# 1. Load and preprocess
+# ============================================================
+df = pd.read_csv(PANEL_PATH)
+
+df["VPD"] = df["vpd"]
+df["SM"] = df["sm"]
+
+# 只保留生长季
+df = df[df["month"].isin([4, 5, 6, 7, 8, 9, 10])].copy()
+
+# 去掉缺失 / 0 / 极端异常值
+for c in ["DI", "VPD", "SM"]:
+    df = df[df[c].notna()]
+    df = df[df[c] != 0]
+
+df = df[(df["DI"] > -5) & (df["DI"] < 5)].copy()
+
+print("Rows after cleaning:", len(df))
+print("Unique grids:", df["grid_id"].nunique())
+
+# ============================================================
+# 2. Define soil-moisture regimes
+# ============================================================
+df["SM_regime"] = pd.qcut(df["SM"], q=3, labels=["Dry", "Normal", "Wet"])
+
+print("\nCounts by SM regime:")
+print(df["SM_regime"].value_counts())
+
+# ============================================================
+# 3. Bin VPD within each SM regime
+#    fewer bins = smoother and more stable
+# ============================================================
+N_BINS = 10
+
+dfs = []
+for regime, sub in df.groupby("SM_regime", observed=False):
+    sub = sub.copy()
+    # 在每个 regime 内部分箱
+    sub["VPD_bin"] = pd.qcut(sub["VPD"], q=N_BINS, duplicates="drop")
+    dfs.append(sub)
+
+df_bin = pd.concat(dfs, ignore_index=True)
+
+# 每个 bin 的中位 VPD 作为横坐标
+bin_mid = (
+    df_bin.groupby(["SM_regime", "VPD_bin"], observed=False)["VPD"]
+    .median()
+    .reset_index()
+    .rename(columns={"VPD": "VPD_mid"})
+)
+
+obs = (
+    df_bin.groupby(["SM_regime", "VPD_bin"], observed=False)["DI"]
+    .median()
+    .reset_index()
+    .rename(columns={"DI": "DI_med"})
+)
+
+obs = obs.merge(bin_mid, on=["SM_regime", "VPD_bin"], how="left")
+
+print("\nObserved binned medians:")
+print(obs.head())
+
+# ============================================================
+# 4. Cluster bootstrap by grid_id
+#    保持面板结构，不按单行抽样
+# ============================================================
+rng = np.random.default_rng(42)
+n_boot = 300
+
+grid_ids = df_bin["grid_id"].unique()
+boot_rows = []
+
+for b in range(n_boot):
+    sampled_grids = rng.choice(grid_ids, size=len(grid_ids), replace=True)
+
+    # 这里直接拼接抽到的格网数据
+    boot_df = pd.concat(
+        [df_bin[df_bin["grid_id"] == gid] for gid in sampled_grids],
+        ignore_index=True
+    )
+
+    # 重新在每个 regime 内做分箱（保持和原分析一致）
+    tmp_list = []
+    for regime, sub in boot_df.groupby("SM_regime", observed=False):
+        sub = sub.copy()
+        if len(sub) < N_BINS:
+            continue
+        sub["VPD_bin"] = pd.qcut(sub["VPD"], q=N_BINS, duplicates="drop")
+        tmp_list.append(sub)
+
+    if len(tmp_list) == 0:
+        continue
+
+    boot_df2 = pd.concat(tmp_list, ignore_index=True)
+
+    # 算每个 regime × bin 的中位 VPD 和中位 DI
+    boot_mid = (
+        boot_df2.groupby(["SM_regime", "VPD_bin"], observed=False)["VPD"]
+        .median()
+        .reset_index()
+        .rename(columns={"VPD": "VPD_mid"})
+    )
+
+    boot_med = (
+        boot_df2.groupby(["SM_regime", "VPD_bin"], observed=False)["DI"]
+        .median()
+        .reset_index()
+        .rename(columns={"DI": "DI_med"})
+    )
+
+    boot_out = boot_med.merge(boot_mid, on=["SM_regime", "VPD_bin"], how="left")
+    boot_out["boot"] = b
+    boot_rows.append(boot_out)
+
+boot = pd.concat(boot_rows, ignore_index=True)
+
+print("\nBootstrap rows:", len(boot))
+
+# ============================================================
+# 5. Summarize bootstrap CI
+# ============================================================
+ci = (
+    boot.groupby(["SM_regime", "VPD_bin"], observed=False)["DI_med"]
+    .agg(
+        median_boot="median",
+        ci_low=lambda x: np.nanpercentile(x, 2.5),
+        ci_high=lambda x: np.nanpercentile(x, 97.5)
+    )
+    .reset_index()
+)
+
+plot_df = obs.merge(ci, on=["SM_regime", "VPD_bin"], how="left")
+plot_df = plot_df.sort_values(["SM_regime", "VPD_mid"]).reset_index(drop=True)
+
+plot_df.to_csv(os.path.join(OUT_DIR, "DI_VPD_SM_bootstrap_summary.csv"), index=False)
+
+print("\nPlot summary:")
+print(plot_df.head())
+
+# ============================================================
+# 6. LOWESS smoothing helper
+# ============================================================
+def smooth_curve(x, y, frac=0.5):
+    """
+    LOWESS smoothing.
+    frac 越大越平滑；0.45~0.6 一般比较合适
+    """
+    valid = ~(np.isnan(x) | np.isnan(y))
+    x = np.asarray(x)[valid]
+    y = np.asarray(y)[valid]
+
+    if len(x) < 4:
+        return x, y
+
+    sm = lowess(y, x, frac=frac, return_sorted=True)
+    return sm[:, 0], sm[:, 1]
+
+# ============================================================
+# 7. Plot smoothed curves + CI bands
+# ============================================================
+plt.figure(figsize=(9, 5.5))
+
+colors = {
+    "Dry": "#6C9DC6",
+    "Normal": "#E39B6D",
+    "Wet": "#88B96A"
+}
+
+for regime in ["Dry", "Normal", "Wet"]:
+    sub = plot_df[plot_df["SM_regime"] == regime].sort_values("VPD_mid")
+
+    x = sub["VPD_mid"].values
+    y = sub["DI_med"].values
+    ylow = sub["ci_low"].values
+    yhigh = sub["ci_high"].values
+
+    # 平滑中位数和CI上下边界
+    xs, ys = smooth_curve(x, y, frac=0.5)
+    x1, y1 = smooth_curve(x, ylow, frac=0.5)
+    x2, y2 = smooth_curve(x, yhigh, frac=0.5)
+
+    # 统一 x 网格，方便 fill_between
+    x_common = np.linspace(np.nanmin(x), np.nanmax(x), 200)
+    ys_i = np.interp(x_common, xs, ys)
+    y1_i = np.interp(x_common, x1, y1)
+    y2_i = np.interp(x_common, x2, y2)
+
+    # CI 阴影
+    plt.fill_between(
+        x_common, y1_i, y2_i,
+        color=colors[regime], alpha=0.18, linewidth=0
+    )
+
+    # 平滑主曲线
+    plt.plot(
+        x_common, ys_i,
+        color=colors[regime], linewidth=2.6,
+        label=regime
+    )
+
+    # 可选：保留原始分箱点，淡一点
+    plt.scatter(
+        x, y,
+        color=colors[regime], s=28, alpha=0.55, zorder=3
+    )
+
+plt.axhline(0, linestyle="--", color="black", linewidth=1.2)
+plt.xlabel("VPD")
+plt.ylabel("Median DI")
+plt.title("Smoothed response of structural–functional decoupling to atmospheric dryness")
+plt.legend(title="SM regime", frameon=False)
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR, "DI_VPD_SM_smooth_CI.png"), dpi=300)
+plt.show()
+
+# ============================================================
+# 8. Optional: cleaner publication version (no points)
+# ============================================================
+plt.figure(figsize=(9, 5.5))
+
+for regime in ["Dry", "Normal", "Wet"]:
+    sub = plot_df[plot_df["SM_regime"] == regime].sort_values("VPD_mid")
+
+    x = sub["VPD_mid"].values
+    y = sub["DI_med"].values
+    ylow = sub["ci_low"].values
+    yhigh = sub["ci_high"].values
+
+    xs, ys = smooth_curve(x, y, frac=0.5)
+    x1, y1 = smooth_curve(x, ylow, frac=0.5)
+    x2, y2 = smooth_curve(x, yhigh, frac=0.5)
+
+    x_common = np.linspace(np.nanmin(x), np.nanmax(x), 200)
+    ys_i = np.interp(x_common, xs, ys)
+    y1_i = np.interp(x_common, x1, y1)
+    y2_i = np.interp(x_common, x2, y2)
+
+    plt.fill_between(
+        x_common, y1_i, y2_i,
+        color=colors[regime], alpha=0.18, linewidth=0
+    )
+    plt.plot(
+        x_common, ys_i,
+        color=colors[regime], linewidth=2.8,
+        label=regime
+    )
+
+plt.axhline(0, linestyle="--", color="black", linewidth=1.2)
+plt.xlabel("VPD")
+plt.ylabel("Median DI")
+plt.title("Structural–functional decoupling under contrasting soil-moisture regimes")
+plt.legend(title="SM regime", frameon=False)
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR, "DI_VPD_SM_smooth_CI_clean.png"), dpi=300)
+plt.show()
+
+print("\nSaved to:", OUT_DIR)
